@@ -10,7 +10,7 @@ MODEL=${MODEL:-"meta-llama/Meta-Llama-3-8B-Instruct"}
 DEPTHS=3
 TRAIN=data/train.jsonl
 VALID=data/val.jsonl
-OUT=output/Depth${DEPTHS}_${MODEL//\//-}_$(date +"%Y%m%d_%H%M")
+OUT=""
 MAXLEN=4096
 EPOCHS=3
 WANDB=matryoshka-reasoning
@@ -38,6 +38,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+: "${OUT:=output/Depth${DEPTHS}_${MODEL//\//-}_$(date +"%Y%m%d_%H%M")}"
 mkdir -p "$OUT" "$LOGDIR"
 export CUDA_VISIBLE_DEVICES=$CUDA_DEVICES
 CMD="deepspeed --include localhost:${CUDA_VISIBLE_DEVICES} \
