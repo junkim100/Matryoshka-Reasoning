@@ -1,14 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# Copyright (c) 2025
+# Licensed under the MIT License
 """
-Matryoshka‑Reasoning – DeepSpeed trainer (saves DS shards only; HF conversion is offline)
-"""
-import json, logging, os
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-from datetime import datetime
+Matryoshka Reasoning — Gate-Only Trainer (fixed oracle)
+Freeze the LM; train only a gating head that selects a global reasoning budget.
+The oracle now measures *answer-only* NLL conditioned on the first B rationale tokens.
 
-import torch, torch.nn.functional as F, deepspeed
+Key changes vs. earlier version
+-------------------------------
+• For each budget b: re-encode with the *over-budget* <think> tokens masked out
+  in attention, and compute CE on the *answer span only*. This makes budgets
+  really affect the answer loss.
+• Soft-oracle is built from those answer CEs plus a light absolute length penalty.
+• Keep LM frozen; only the gate MLP is trained. Safe with ZeRO-3.
+
+Quick start
+-----------
+deepspeed --include localhost:0 src/train.py \
+  --model_name_or_path deepseek-ai/DeepSeek-R1-Distill-Llama-8B \
+  --train_file data/train.jsonl --valid_file data/val.jsonl \
+  --output_dir out/gate_only_deepseek_r1 \
+  --budgets "0,4,16,64,256,1024" --max_length 4096
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import ast
+import json
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import deepspeed
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
@@ -19,7 +49,9 @@ except ImportError:
     wandb = None
 
 
-# ---------------- helpers & logging ---------------- #
+# ------------------------------ Logging --------------------------------- #
+
+
 def is_rank0() -> bool:
     return (
         not torch.distributed.is_available()
@@ -34,65 +66,114 @@ def get_logger(level: str = "INFO") -> logging.Logger:
     return logging.getLogger("train")
 
 
-# --------------------- dataset --------------------- #
-SYSTEM_MSG = "You are a helpful reasoning assistant. Think step‑by‑step, then answer."
+# ------------------------------- Data ----------------------------------- #
+
+SYSTEM_MSG = "You are a helpful reasoning assistant. Think step-by-step, then answer."
 
 
 class JsonlDS(Dataset):
+    """Each line: {"question": str, "solution": str, "answer": str}"""
+
     def __init__(self, path: str):
-        rows = []
+        rows: List[Dict[str, Any]] = []
         with open(path, "r", encoding="utf-8") as f:
             for l in f:
                 l = l.strip()
-                if l:
-                    rows.append(json.loads(l))
+                if not l:
+                    continue
+                try:
+                    obj = json.loads(l)
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and {"question", "solution", "answer"} <= set(
+                    obj.keys()
+                ):
+                    rows.append(obj)
         if not rows:
-            raise ValueError(f"Empty dataset: {path}")
-        self.rows: List[Dict[str, Any]] = rows
+            raise ValueError(f"Empty or invalid dataset: {path}")
+        self.rows = rows
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.rows)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
         return self.rows[idx]
 
 
-# ---------------- depth utilities ------------------ #
-def make_depths(n: int, L: int) -> List[int]:
+def parse_budgets_arg(
+    budgets: Any,
+    max_length: int,
+    default=(0, 4, 16, 64, 256, 1024),
+) -> List[int]:
     """
-    Depth schedule: [0, k1, …, -1] with kᵢ ∈ [1, max(1, L-1)].
-    Mids spaced roughly in [0.3·L, 0.7·L].
+    Parse budgets from CSV / JSON / tuple / list.
+    • negatives -> max_length
+    • clamp to [0, max_length]
+    • dedupe + sort
+    • ensure 0 is present
     """
-    if n <= 1:
-        return [-1]
-    mids = n - 2
-    if mids <= 0:
-        return [0, -1]
-    upper = max(1, L - 1)
-    lo = max(1, int(0.30 * L))
-    hi = max(1, int(0.70 * L))
-    if hi <= lo:
-        mid_k = max(1, min(upper, max(1, L // 2)))
-        ks = [mid_k] * mids
+    if budgets is None or (isinstance(budgets, str) and budgets.strip() == ""):
+        arr = list(default)
+    elif isinstance(budgets, (list, tuple)):
+        arr = list(budgets)
     else:
-        step = (hi - lo) / (mids + 1)
-        ks = [max(1, min(upper, int(lo + (i + 1) * step))) for i in range(mids)]
-    return [0] + ks + [-1]
+        s = str(budgets).strip()
+        if (s.startswith("[") and s.endswith("]")) or (
+            s.startswith("(") and s.endswith(")")
+        ):
+            try:
+                lit = ast.literal_eval(s)
+                arr = (
+                    list(lit)
+                    if isinstance(lit, (list, tuple))
+                    else [int(x) for x in re.findall(r"-?\d+", s)]
+                )
+            except Exception:
+                arr = [int(x) for x in re.findall(r"-?\d+", s)]
+        else:
+            arr = [int(x) for x in re.findall(r"-?\d+", s)]
+
+    out: List[int] = []
+    for x in arr:
+        if x is None:
+            continue
+        xi = int(x)
+        if xi < 0:
+            xi = max_length
+        xi = min(max_length, max(0, xi))
+        out.append(xi)
+
+    out = sorted(set(out))
+    if 0 not in out:
+        out = [0] + out
+    if len(out) == 0:
+        out = list(default)
+    return out
 
 
-# --------------- collator -------------------------- #
-class MatryoshkaCollator:
+class ReasoningCollator:
     """
-    Out:
+    Tokenizes chat; records indices of <think>, </think>, answer span, and end-of-seq.
+    Also builds a gate anchor mask.
+
+    Output:
         input_ids      : [B, L]
         attention_mask : [B, L]
-        labels_by_depth: { i: Tensor[B, L] } for i in range(D)  (‑100 masked)
+        gate_mask      : [B, L]
+        info: {
+          "think_idx"  : [B]    index of "<think>" token in input_ids, or answer start fallback
+          "cthink_idx" : [B]    index of "</think>", or -1 if missing
+          "stop_idx"   : [B]    index of the last EOS/EOT in visible region
+          "ans_span"   : [B,2]  [start, end) inclusive-exclusive in input_ids
+        }
     """
 
-    def __init__(self, tok: AutoTokenizer, num_depths: int, max_len: int):
+    def __init__(
+        self, tok: AutoTokenizer, max_length: int, gate_anchor: str = "prethink"
+    ):
         self.tok = tok
-        self.max_len = max_len
-        self.depths = make_depths(num_depths, max_len)
+        self.max_length = max_length
+        self.gate_anchor = gate_anchor  # "prethink" | "think" | "prompt_mean"
 
         for t in ["<think>", "</think>"]:
             if t not in self.tok.get_vocab():
@@ -100,27 +181,21 @@ class MatryoshkaCollator:
 
         self.eos_id = self.tok.eos_token_id
         self.eot_id = getattr(self.tok, "eot_token_id", None)
-        self.think_id = self.tok.convert_tokens_to_ids("<think>")
+        self.t_think = self.tok.convert_tokens_to_ids("<think>")
+        self.t_cthink = self.tok.convert_tokens_to_ids("</think>")
 
-    def __call__(self, batch: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
-        ids_all, attn_all = [], []
-        labels_by_depth = {i: [] for i in range(len(self.depths))}
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        input_ids, attn, gate_masks = [], [], []
+        think_idx, cthink_idx, stop_idx, ans_spans = [], [], [], []
 
         for ex in batch:
             q, sol, ans = ex["question"], ex["solution"], ex["answer"]
 
-            # normalize spaces inside \boxed{ ... } to reduce false mismatches
-            sol = sol.replace("\\boxed{ ", "\\boxed{").replace(" }", "}")
-
-            # ensure <think>…</think> and a boxed answer suffix
-            if "<think>" not in sol and "**Final Answer**" in sol:
-                sol = "<think>" + sol.replace(
-                    "**Final Answer**", "</think>\n**Final Answer**"
-                )
-            elif "<think>" not in sol and "\\boxed" in sol:
-                sol = "<think>" + sol.replace("\\boxed", "</think>\n\\boxed")
+            # Ensure rationale & answer blocks exist; be robust to datasets lacking explicit tags.
+            if "<think>" not in sol and "\\boxed" in sol:
+                sol = "<think>" + sol.replace("\\boxed", "</think>\n\n\\boxed")
             elif "<think>" not in sol:
-                sol = f"<think>{sol}</think>\n\\boxed{{{ans}}}"
+                sol = f"<think>{sol}</think>\n\n\\boxed{{{ans}}}"
 
             chat = [
                 {"role": "system", "content": SYSTEM_MSG},
@@ -130,89 +205,236 @@ class MatryoshkaCollator:
             txt = self.tok.apply_chat_template(chat, tokenize=False)
             enc = self.tok(
                 txt,
-                max_length=self.max_len,
+                max_length=self.max_length,
                 truncation=True,
                 padding="max_length",
                 add_special_tokens=False,
                 return_tensors="pt",
             )
-            ids, msk = enc.input_ids[0], enc.attention_mask[0]
+            ids = enc.input_ids[0]
+            mask = enc.attention_mask[0]
+            L = int(mask.sum().item())
 
-            content_len = int(msk.sum().item())
-            content_ids = ids[:content_len]
-            eos_mask = content_ids == self.eos_id
+            # Stop index: last EOS/EOT in visible region
+            vis = ids[:L]
+            eom = vis == self.eos_id
             if self.eot_id is not None:
-                eos_mask = eos_mask | (content_ids == self.eot_id)
-            eos_pos = eos_mask.nonzero(as_tuple=False)
-            has_end = eos_pos.numel() > 0
-            sid = int(eos_pos[-1].item()) if has_end else (content_len - 1)
+                eom = eom | (vis == self.eot_id)
+            eos_pos = eom.nonzero(as_tuple=False)
+            sid = int(eos_pos[-1].item()) if eos_pos.numel() > 0 else (L - 1)
 
-            think_pos = (ids == self.think_id).nonzero(as_tuple=True)
-            found_think = len(think_pos[0]) > 0
-            r0 = int(think_pos[0][0]) if found_think else 0
+            # Indices of <think> and </think>
+            tpos = (ids == self.t_think).nonzero(as_tuple=True)[0]
+            cpos = (ids == self.t_cthink).nonzero(as_tuple=True)[0]
+            found_t = len(tpos) > 0
+            found_c = len(cpos) > 0
+            r0 = int(tpos[0]) if found_t else 0
+            c0 = int(cpos[0]) if found_c else -1
 
-            # tolerant boxed/raw matching
-            raw_norm = ans.strip().replace("−", "-")
+            # Locate answer span (robust)
+            raw_norm = str(ans).strip().replace("−", "-")
             patterns = [
                 self.tok.encode(f"\\boxed{{{raw_norm}}}", add_special_tokens=False),
                 self.tok.encode(raw_norm, add_special_tokens=False),
                 self.tok.encode(" " + raw_norm, add_special_tokens=False),
-                self.tok.encode("(" + raw_norm + ")", add_special_tokens=False),
             ]
 
-            def find_span_range(ids_t, pattern, start, end):
-                if not pattern:
+            def find_span(ids_t, pat, start, end):
+                if not pat:
                     return -1, -1
                 seq = ids_t[start:end].tolist()
-                M = len(pattern)
-                for i in range(len(seq) - M + 1):
-                    if seq[i : i + M] == pattern:
-                        return start + i, start + i + M
+                m = len(pat)
+                for i in range(len(seq) - m + 1):
+                    if seq[i : i + m] == pat:
+                        return start + i, start + i + m
                 return -1, -1
 
-            a_sp, a_ep = (-1, -1)
+            a_st, a_en = (-1, -1)
             for pat in patterns:
-                a_sp, a_ep = find_span_range(ids, pat, r0, content_len)
-                if a_sp >= 0:
+                a_st, a_en = find_span(ids, pat, r0, L)
+                if a_st >= 0:
                     break
-            if a_sp < 0:
-                a_ep = sid
-                a_sp = max(r0, sid - 1)
+            if a_st < 0:
+                a_en = sid
+                a_st = max(r0, sid - 1)
 
-            if not found_think:
-                r0 = a_sp
+            if not found_t:
+                r0 = a_st  # fallback: anchor at answer start
 
-            L = max(1, sid - r0)
-            depths = make_depths(len(self.depths), L)
+            # Gate mask by anchor
+            gm = torch.zeros_like(ids, dtype=torch.float32)
+            if self.gate_anchor == "think":
+                if 0 <= r0 < len(gm):
+                    gm[r0] = 1.0
+            elif self.gate_anchor == "prethink":
+                anchor = max(0, r0 - 1)
+                gm[anchor] = 1.0
+            else:  # prompt_mean
+                gm[: max(1, r0)] = 1.0
 
-            for i, d in enumerate(depths):
-                lab = ids.clone().fill_(-100)
-                if d == 0:
-                    lab[a_sp:a_ep] = ids[a_sp:a_ep]
-                else:
-                    end = (sid + 1) if (d == -1 and has_end) else min(r0 + d, sid)
-                    if end > r0:
-                        lab[r0:end] = ids[r0:end]
-                    lab[a_sp:a_ep] = ids[a_sp:a_ep]
-                    if d == -1 and has_end:
-                        lab[sid] = ids[sid]
-                if lab.eq(-100).all():
-                    lab[a_sp:a_ep] = ids[a_sp:a_ep]
-                labels_by_depth[i].append(lab)
-
-            ids_all.append(ids)
-            attn_all.append(msk)
+            input_ids.append(ids)
+            attn.append(mask)
+            gate_masks.append(gm)
+            think_idx.append(r0)
+            cthink_idx.append(c0)
+            stop_idx.append(sid)
+            ans_spans.append([a_st, a_en])
 
         return {
-            "input_ids": torch.stack(ids_all),
-            "attention_mask": torch.stack(attn_all),
-            "labels_by_depth": {i: torch.stack(v) for i, v in labels_by_depth.items()},
+            "input_ids": torch.stack(input_ids),
+            "attention_mask": torch.stack(attn),
+            "gate_mask": torch.stack(gate_masks),
+            "info": {
+                "think_idx": torch.tensor(think_idx, dtype=torch.long),
+                "cthink_idx": torch.tensor(cthink_idx, dtype=torch.long),
+                "stop_idx": torch.tensor(stop_idx, dtype=torch.long),
+                "ans_span": torch.tensor(ans_spans, dtype=torch.long),
+            },
         }
 
 
-# -------------- DeepSpeed cfg patch helper ---------------- #
-def patch_ds_cfg(cfg_path: str, lr: float, total_steps: int, micro_bs: int) -> str:
-    with open(cfg_path) as f:
+# --------------------------- Gate head ---------------------------------- #
+
+
+@dataclass
+class GateConfig:
+    hidden_mult: float = 2.0
+    dropout: float = 0.0
+    temperature: float = 1.0  # divides logits inside forward()
+
+
+class GateMLP(nn.Module):
+    """Two-layer MLP with SiLU."""
+
+    def __init__(self, in_dim: int, out_dim: int, cfg: GateConfig, dtype: torch.dtype):
+        super().__init__()
+        hid = max(64, int(in_dim * cfg.hidden_mult))
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hid, bias=True),
+            nn.SiLU(),
+            nn.Dropout(p=cfg.dropout),
+            nn.Linear(hid, out_dim, bias=True),
+        )
+        self.net.to(dtype=dtype)
+        self.cfg = cfg
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(next(self.net[0].parameters()).dtype)
+        return self.net(x) / max(1e-6, self.cfg.temperature)
+
+
+# --------------------- Gated wrapper (LM frozen) ------------------------ #
+
+
+class GateOnlyWrapper(nn.Module):
+    """
+    Wrap a HF causal LM but freeze it. We still need:
+      • last hidden state (no grads) to pool gate features
+      • token-wise NLL computed via lm_head
+    Only the gate MLP has trainable parameters.
+    """
+
+    def __init__(
+        self, base: AutoModelForCausalLM, num_classes: int, gate_cfg: GateConfig
+    ):
+        super().__init__()
+        self.base = base
+        for p in self.base.parameters():
+            p.requires_grad = False
+
+        hidden = getattr(self.base.config, "hidden_size", None) or getattr(
+            self.base.config, "n_embd", None
+        )
+        if hidden is None:
+            raise ValueError("Cannot infer hidden size from model.config")
+
+        # Model/lm_head handles (generic across HF causal LMs)
+        self.transformer = getattr(self.base, "model", None)
+        if self.transformer is None:
+            raise ValueError("Expected base.model to exist (HF causal LM).")
+        self.norm = getattr(self.transformer, "norm", None)
+        self.lm_head = self.base.get_output_embeddings()
+
+        # Gate head dtype matches base params to avoid dtype mismatch in DS
+        param_dtype = next(self.base.parameters()).dtype
+        self.gate = GateMLP(
+            in_dim=hidden, out_dim=num_classes, cfg=gate_cfg, dtype=param_dtype
+        )
+
+    @torch.no_grad()
+    def _encode(self, input_ids, attention_mask):
+        out = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            return_dict=True,
+        )
+        last_h = out.last_hidden_state  # [B,L,H]
+        h_for_lm = self.norm(last_h) if self.norm is not None else last_h
+        return last_h, h_for_lm
+
+    def forward(self, input_ids=None, attention_mask=None, gate_mask=None):
+        # Encode without grads
+        last_h, h_for_lm = self._encode(input_ids, attention_mask)
+
+        # Pool gate feature with normalized mask
+        if gate_mask is None:
+            vis = attention_mask.to(dtype=last_h.dtype)
+            denom = vis.sum(dim=1, keepdim=True).clamp_min(1.0)
+            feat = (last_h * vis.unsqueeze(-1)).sum(dim=1) / denom
+        else:
+            gm = gate_mask.to(dtype=last_h.dtype)
+            denom = gm.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            feat = (last_h * gm.unsqueeze(-1)).sum(dim=1) / denom
+
+        # Gate logits (trainable)
+        gate_logits = self.gate(feat)  # [B, D]
+
+        return {"last_h": last_h, "h_for_lm": h_for_lm, "gate_logits": gate_logits}
+
+
+# ---------------------- Loss/NLL utilities ------------------------------ #
+
+
+@torch.no_grad()
+def per_token_nll_from_hidden(
+    h_for_lm: torch.Tensor,  # [B, L, H]
+    lm_head: nn.Module,  # Linear(H->V)
+    input_ids: torch.Tensor,  # [B, L]
+    chunk: int = 256,
+) -> torch.Tensor:
+    """
+    Compute token-level NLL for standard teacher-forcing:
+    targets = input_ids[:, 1:] aligned to logits over positions [:, :-1]
+    Returns: nll_tok: [B, L-1] in float32
+    """
+    B, L, H = h_for_lm.shape
+    T = L - 1
+    nll = torch.empty((B, T), dtype=torch.float32, device=h_for_lm.device)
+    for s in range(0, T, chunk):
+        e = min(s + chunk, T)
+        logits_chunk = lm_head(h_for_lm[:, s:e, :])  # [B, e-s, V] (bf16)
+        targets = input_ids[:, s + 1 : e + 1]  # [B, e-s]
+        ce = F.cross_entropy(
+            logits_chunk.transpose(1, 2),  # [B, V, e-s]
+            targets,
+            reduction="none",
+        ).to(
+            torch.float32
+        )  # [B, e-s]
+        nll[:, s:e] = ce
+        del logits_chunk, targets, ce
+    return nll
+
+
+# -------------------------- DeepSpeed helper ---------------------------- #
+
+
+def patch_ds_cfg(
+    cfg_path: str, lr: float, total_steps: int, micro_bs: Optional[int]
+) -> str:
+    abs_path = os.path.abspath(cfg_path)
+    with open(abs_path, "r") as f:
         cfg = json.load(f)
 
     cfg.setdefault("optimizer", {})
@@ -231,92 +453,112 @@ def patch_ds_cfg(cfg_path: str, lr: float, total_steps: int, micro_bs: int) -> s
             },
         }
 
-    cfg["train_micro_batch_size_per_gpu"] = int(micro_bs)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     grad_acc = int(cfg.get("gradient_accumulation_steps", 1))
-    cfg["train_batch_size"] = int(micro_bs) * grad_acc * world_size
+    if micro_bs is not None:
+        cfg["train_micro_batch_size_per_gpu"] = int(micro_bs)
+        cfg["train_batch_size"] = int(micro_bs) * grad_acc * world_size
+    else:
+        micro = int(cfg.get("train_micro_batch_size_per_gpu", 1))
+        cfg["train_batch_size"] = micro * grad_acc * world_size
 
-    patched = cfg_path + ".patched"
-    with open(patched, "w") as f:
-        json.dump(cfg, f, indent=2)
+    patched = abs_path + ".patched"
+    if is_rank0():
+        tmp = patched + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, patched)
+
+    if torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    if not os.path.exists(patched):
+        raise RuntimeError(f"Patched DeepSpeed config not found: {patched}")
     return patched
 
 
-# -------------------- trainer ---------------------- #
+# ------------------------------- Train ---------------------------------- #
+
+
 def train(
     model_name_or_path: str,
     train_file: str,
     output_dir: str,
     valid_file: str = "",
-    num_depths: int = 1,
+    # sequence / budgets
     max_length: int = 4096,
-    depth_weights: str = "",
-    learning_rate: float = 1e-5,
-    per_device_train_batch_size: int = 1,
-    num_train_epochs: int = 3,
+    budgets: str = "0,4,16,64,256,1024",
+    ce_chunk_tokens: int = 256,
+    # gating
+    use_gating: bool = True,  # for API parity; always True here
+    gate_anchor: str = "prethink",  # "prethink" | "think" | "prompt_mean"
+    gate_temperature: float = 1.0,
+    gate_hidden_mult: float = 2.0,
+    gate_dropout: float = 0.0,
+    gate_entropy_penalty: float = 0.02,  # <-- default tuned
+    gate_length_penalty: float = 0.05,  # <-- default tuned
+    oracle_temperature: float = 0.25,  # <-- default tuned (sharper targets)
+    hard_oracle_weight: float = 0.0,  # optional CE to argmin(b) (off)
+    exp_loss_weight: float = 0.0,  # optional E_p[b][loss_b] (off)
+    # optimization / ds
+    learning_rate: float = 1e-4,  # gate only; a bit higher is fine
+    num_train_epochs: int = 2,
+    per_device_train_batch_size: Optional[int] = None,
     logging_steps: int = 20,
-    save_steps: int = 100,
-    eval_steps: int = 100,
+    save_steps: int = 1000,
+    eval_steps: int = 200,
     deepspeed_config: str = "configs/ds_config.json",
     wandb_project: str = "",
     bf16: bool = True,
     max_eval_batches: int = 0,
     log_level: str = "INFO",
-    local_rank: int = -1,
-    **_unused,  # swallow any extra CLI flags
+    **_unused,
 ):
-    # If DeepSpeed/torchrun passed LOCAL_RANK, set the CUDA device (optional)
-    try:
-        lr = int(os.environ.get("LOCAL_RANK", local_rank if local_rank != -1 else 0))
-        if torch.cuda.is_available():
-            torch.cuda.set_device(lr)
-    except Exception:
-        pass
-
-    log = get_logger(log_level)
+    # Pin device per rank
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
 
     torch.manual_seed(42)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+        torch.cuda.manual_seed(42)
 
-    tok = AutoTokenizer.from_pretrained(model_name_or_path)
-    tok.pad_token = tok.eos_token
+    log = get_logger(log_level)
+
+    # Tokenizer
+    tok = AutoTokenizer.from_pretrained(model_name_or_path, use_fast=True)
+    if tok.pad_token is None and tok.eos_token is not None:
+        tok.pad_token = tok.eos_token
     tok.truncation_side = "left"
 
-    coll = MatryoshkaCollator(tok, num_depths, max_length)
-    depths = coll.depths
-    D = len(depths)
+    # Budgets
+    BUDGETS = parse_budgets_arg(budgets, max_length=max_length)
+    D = len(BUDGETS)
+    if is_rank0():
+        log.info(f"> Global budgets: {BUDGETS} (classes={D}, max_length={max_length})")
 
-    if depth_weights:
-        w = [float(x) for x in depth_weights.split(",")]
-        if len(w) != D:
-            raise ValueError(
-                f"--depth_weights must have exactly {D} comma‑separated values"
-            )
-        weights = torch.tensor(w, dtype=torch.float32)
-    else:
-        weights = torch.tensor(
-            [1.0] if D == 1 else [0.1] + [0.9 / (D - 1)] * (D - 1), dtype=torch.float32
-        )
-    log.info(f"> Depth schedule  : {depths}")
-    log.info(f"> Depth weights   : {weights.tolist()}")
-
+    # Distributed
     if (not torch.distributed.is_initialized()) and int(
         os.environ.get("WORLD_SIZE", "1")
     ) > 1:
         deepspeed.init_distributed()
 
+    # Data
     train_ds = JsonlDS(train_file)
     sampler = (
         DistributedSampler(train_ds) if torch.distributed.is_initialized() else None
     )
+    collator = ReasoningCollator(tok, max_length=max_length, gate_anchor=gate_anchor)
+
     dl = DataLoader(
         train_ds,
-        batch_size=per_device_train_batch_size,
+        batch_size=per_device_train_batch_size or 1,
         sampler=sampler,
         shuffle=(sampler is None),
-        collate_fn=coll,
-        num_workers=2,
+        collate_fn=collator,
+        num_workers=0,
         pin_memory=True,
     )
 
@@ -330,11 +572,11 @@ def train(
         )
         val_dl = DataLoader(
             val_ds,
-            batch_size=per_device_train_batch_size,
+            batch_size=per_device_train_batch_size or 1,
             sampler=val_sampler,
             shuffle=False,
-            collate_fn=coll,
-            num_workers=2,
+            collate_fn=collator,
+            num_workers=0,
             pin_memory=True,
         )
 
@@ -343,108 +585,276 @@ def train(
         deepspeed_config, learning_rate, total_steps, per_device_train_batch_size
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
+    # Model
+    dtype = torch.bfloat16 if bf16 else torch.float16
+    base = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
-        torch_dtype=torch.bfloat16 if bf16 else torch.float16,
-        low_cpu_mem_usage=True,
+        torch_dtype=dtype,
         use_cache=False,
     )
-    if len(tok) != model.config.vocab_size:
-        model.resize_token_embeddings(len(tok))
+    if len(tok) != base.config.vocab_size:
+        # only happens if we added new special tokens
+        base.resize_token_embeddings(len(tok))
+
+    if hasattr(base, "gradient_checkpointing_enable"):
+        base.gradient_checkpointing_enable()  # OK even if LM frozen (keeps memory lower)
+
+    gate_cfg = GateConfig(
+        hidden_mult=gate_hidden_mult, dropout=gate_dropout, temperature=gate_temperature
+    )
+    model = GateOnlyWrapper(base, num_classes=D, gate_cfg=gate_cfg)
+
+    # Only gate params are trainable
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if is_rank0():
+        n_gate = sum(p.numel() for p in trainable)
+        log.info(f"> Trainable parameters (gate only): {n_gate/1e6:.3f} M")
 
     engine, _, _, _ = deepspeed.initialize(
         model=model,
-        model_parameters=model.parameters(),
+        model_parameters=trainable,  # only gate params go to optimizer
         config=ds_cfg_patched,
     )
 
-    weights = weights.to(engine.device)
-
-    os.makedirs(output_dir, exist_ok=True)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     if wandb_project and is_rank0() and wandb is not None:
-        base = model_name_or_path.split("/")[-1]
-        ts = datetime.now().strftime("%Y%m%d_%H%M")
-        run_name = f"Depth{D}_{base}_{ts}"
+        base_name = Path(model_name_or_path).name
+        run_name = f"{base_name}|GATE-ONLY|{gate_anchor}|{D}b"
         wandb.init(project=wandb_project, name=run_name)
         wandb.config.update(
             dict(
                 model=model_name_or_path,
-                num_depths=D,
+                budgets=BUDGETS,
                 max_length=max_length,
-                learning_rate=learning_rate,
-                num_train_epochs=num_train_epochs,
-                per_device_train_batch_size=per_device_train_batch_size,
+                ce_chunk_tokens=ce_chunk_tokens,
+                gate_anchor=gate_anchor,
+                gate_temperature=gate_temperature,
+                gate_hidden_mult=gate_hidden_mult,
+                gate_dropout=gate_dropout,
+                gate_length_penalty=gate_length_penalty,
+                oracle_temperature=oracle_temperature,
+                hard_oracle_weight=hard_oracle_weight,
+                exp_loss_weight=exp_loss_weight,
+                lr=learning_rate,
+                epochs=num_train_epochs,
             )
         )
 
-    # ------------------- loss fn ------------------- #
-    def batch_loss(batch):
+    # ---------------- core step function (fixed oracle) ---------------- #
+
+    def step_once(
+        batch: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         input_ids = batch["input_ids"].to(engine.device)
         attention_mask = batch["attention_mask"].to(engine.device)
+        gate_mask = batch["gate_mask"].to(engine.device)
+        info = batch["info"]
+        think_idx = info["think_idx"].to(engine.device)
+        cthink_idx = info["cthink_idx"].to(engine.device)
+        stop_idx = info["stop_idx"].to(engine.device)
+        ans_span = info["ans_span"].to(engine.device)
 
-        labels_by_d = batch["labels_by_depth"]
-        _D = len(labels_by_d)
-        labels = torch.stack([labels_by_d[i] for i in range(_D)], dim=0).to(
-            engine.device
-        )  # [D,B,L]
+        # Forward (LM frozen) for gate features & logits
+        out = engine(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            gate_mask=gate_mask,
+        )
+        gate_logits = out["gate_logits"]  # [B,D]
 
-        logits = engine(
-            input_ids=input_ids, attention_mask=attention_mask
-        ).logits  # [B,L,V]
+        B, L = input_ids.size()
+        T = L - 1
+        D_ = len(BUDGETS)
+        assert D_ == gate_logits.size(-1)
 
-        logits_shift = logits[..., :-1, :]  # [B,L-1,V]
-        labels_shift = labels[..., 1:]  # [D,B,L-1]
-        mask = labels_shift.ne(-100)  # [D,B,L-1]
+        # Build CE masks for answer tokens (over CE time indices)
+        ans_masks = []
+        for i in range(B):
+            a_st, a_en = int(ans_span[i, 0].item()), int(ans_span[i, 1].item())
+            m = torch.zeros(T, dtype=torch.bool, device=engine.device)
+            if a_st >= 1 and a_en > a_st:
+                t0 = max(0, a_st - 1)
+                t1 = min(T, a_en - 1)  # exclusive
+                m[t0:t1] = True
+            ans_masks.append(m)
+        ans_masks = torch.stack(ans_masks)  # [B,T]
 
-        _D, B, Lm1 = labels_shift.shape
-        V = logits_shift.size(-1)
-        logits_expand = logits_shift.unsqueeze(0).expand(_D, -1, -1, -1)
+        loss_db = torch.empty((B, D_), dtype=torch.float32, device=engine.device)
 
-        loss_flat = F.cross_entropy(
-            logits_expand.reshape(-1, V),
-            labels_shift.reshape(-1),
-            ignore_index=-100,
-            reduction="none",
-        ).view(_D, B, Lm1)
+        # For each budget: hide *excess* rationale tokens and re-encode (no grad)
+        for j, budget in enumerate(BUDGETS):
+            # Copy attention; we'll zero out over-budget <think> tokens
+            attn_b = attention_mask.clone()
 
-        masked_loss = loss_flat * mask.float()
-        token_counts = mask.sum(dim=(1, 2)).clamp_min(1.0)  # [D]
-        loss_per_depth = masked_loss.sum(dim=(1, 2)) / token_counts
-        total_loss = (loss_per_depth * weights).sum()
-        return total_loss, loss_per_depth, token_counts
+            for i in range(B):
+                t_idx = int(think_idx[i].item())  # position of "<think>"
+                c_idx = int(cthink_idx[i].item())  # position of "</think>" (or -1)
+                s_idx = int(stop_idx[i].item())  # last visible (eos/eot)
+                # Range of rationale tokens = (t_idx+1) .. end_reason_pos (inclusive)
+                end_reason_pos = (c_idx if c_idx >= 0 else s_idx) - 1
+                if end_reason_pos <= t_idx:
+                    continue  # no rationale in the window
 
-    @torch.no_grad()
-    def evaluate(val_dl_local):
-        if val_dl_local is None:
-            return None
-        engine.eval()
-        tot_loss_tokens = torch.zeros(D, device=engine.device)
-        tot_tokens = torch.zeros(D, device=engine.device)
-        for bi, batch in enumerate(val_dl_local):
-            _, depth_losses, token_counts = batch_loss(batch)
-            tot_loss_tokens += depth_losses * token_counts
-            tot_tokens += token_counts
-            if max_eval_batches and (bi + 1) >= max_eval_batches:
-                break
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(
-                tot_loss_tokens, op=torch.distributed.ReduceOp.SUM
-            )
-            torch.distributed.all_reduce(tot_tokens, op=torch.distributed.ReduceOp.SUM)
-        mean_per_depth = tot_loss_tokens / tot_tokens.clamp_min(1.0)
-        total = (mean_per_depth * weights).sum()
-        engine.train()
-        return (
-            total.item(),
-            mean_per_depth.detach().cpu().tolist(),
-            tot_tokens.detach().cpu().tolist(),
+                # Keep only the first `budget` rationale tokens (after <think>)
+                keep_last_pos = min(t_idx + budget, end_reason_pos)
+
+                hide_start = max(keep_last_pos + 1, 0)
+                hide_end = max(end_reason_pos + 1, hide_start)  # slice exclusive
+                if hide_end > hide_start:
+                    attn_b[i, hide_start:hide_end] = (
+                        0  # invisible to all subsequent tokens
+                    )
+
+            with torch.no_grad():
+                out_b = engine.module.transformer(
+                    input_ids=input_ids,
+                    attention_mask=attn_b,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                h_last = out_b.last_hidden_state
+                h_lm = (
+                    engine.module.norm(h_last)
+                    if engine.module.norm is not None
+                    else h_last
+                )
+
+                nll_tok_b = per_token_nll_from_hidden(
+                    h_for_lm=h_lm,
+                    lm_head=engine.module.lm_head,
+                    input_ids=input_ids,
+                    chunk=ce_chunk_tokens,
+                )  # [B,T]
+
+                # Answer-only CE under this budget
+                num = (nll_tok_b * ans_masks.float()).sum(dim=1)
+                den = ans_masks.float().sum(dim=1).clamp_min(1.0)
+                loss_db[:, j] = num / den
+
+            # free budget-local tensors
+            del attn_b, out_b, h_last, h_lm, nll_tok_b
+
+        # Soft oracle (length-regularized)
+        length_cost = (
+            torch.tensor(BUDGETS, dtype=torch.float32, device=engine.device)
+            / float(max_length)
+        ).unsqueeze(0)
+        score = -(loss_db + gate_length_penalty * length_cost) / max(
+            1e-6, oracle_temperature
+        )  # [B,D]
+        q = F.softmax(score, dim=-1)  # [B,D]
+        hard = (loss_db + gate_length_penalty * length_cost).argmin(dim=-1)  # [B]
+
+        # Gate distribution
+        p = F.softmax(gate_logits.float(), dim=-1)
+        logp = torch.log(p.clamp_min(1e-8))
+
+        # Loss: CE with soft targets (KL up to constant)
+        gate_loss = -(q * logp).sum(dim=-1).mean()
+
+        # Optional additions
+        hard_ce = (
+            F.cross_entropy(gate_logits.float(), hard)
+            if hard_oracle_weight > 0.0
+            else torch.tensor(0.0, device=engine.device)
+        )
+        ent_pen = torch.tensor(0.0, device=engine.device)
+        if gate_entropy_penalty != 0.0:
+            ent = (-(p * logp)).sum(dim=-1).mean()
+            ent_pen = gate_entropy_penalty * ent
+        exp_loss = (
+            (p * loss_db).sum(dim=-1).mean()
+            if exp_loss_weight > 0.0
+            else torch.tensor(0.0, device=engine.device)
         )
 
-    # ---------------- training loop -------------- #
+        total = gate_loss + hard_oracle_weight * hard_ce + ent_pen + exp_loss
+
+        with torch.no_grad():
+            oracle_agree = (p.argmax(dim=-1) == hard).float().mean()
+            gate_mean = p.mean(dim=0)
+            loss_spread = (loss_db.max(dim=1).values - loss_db.min(dim=1).values).mean()
+            avg_ans_ce = loss_db.mean()
+
+        stats = {
+            "gate_loss": gate_loss.detach(),
+            "hard_ce": hard_ce.detach(),
+            "entropy_pen": ent_pen.detach(),
+            "exp_loss": exp_loss.detach(),
+            "oracle_agreement": oracle_agree.detach(),
+            "loss_per_budget_mean": loss_db.mean(dim=0).detach(),  # [D]
+            "gate_probs_mean": gate_mean.detach(),  # [D]
+            "loss_spread": loss_spread.detach(),
+            "avg_ans_ce": avg_ans_ce.detach(),
+        }
+        return total, stats
+
+    @torch.no_grad()
+    def evaluate(val_loader):
+        if val_loader is None:
+            return None
+        engine.eval()
+        acc = {
+            "gate_loss": 0.0,
+            "hard_ce": 0.0,
+            "entropy_pen": 0.0,
+            "exp_loss": 0.0,
+            "oracle_agreement": 0.0,
+            "loss_spread": 0.0,
+            "avg_ans_ce": 0.0,
+        }
+        loss_budget_sum = torch.zeros(D, dtype=torch.float32, device=engine.device)
+        gate_prob_sum = torch.zeros(D, dtype=torch.float32, device=engine.device)
+        n = 0
+
+        for bi, batch in enumerate(val_loader):
+            total, st = step_once(batch)
+            acc["gate_loss"] += float(st["gate_loss"].item())
+            acc["hard_ce"] += float(st["hard_ce"].item())
+            acc["entropy_pen"] += float(st["entropy_pen"].item())
+            acc["exp_loss"] += float(st["exp_loss"].item())
+            acc["oracle_agreement"] += float(st["oracle_agreement"].item())
+            acc["loss_spread"] += float(st["loss_spread"].item())
+            acc["avg_ans_ce"] += float(st["avg_ans_ce"].item())
+            loss_budget_sum += st["loss_per_budget_mean"]
+            gate_prob_sum += st["gate_probs_mean"]
+            n += 1
+            if max_eval_batches and (bi + 1) >= max_eval_batches:
+                break
+
+        if torch.distributed.is_initialized():
+            # Reduce scalars
+            for k in acc:
+                t = torch.tensor(acc[k], device=engine.device)
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+                acc[k] = float(t.item())
+            n_t = torch.tensor(float(n), device=engine.device)
+            torch.distributed.all_reduce(n_t, op=torch.distributed.ReduceOp.SUM)
+            n = int(n_t.item())
+            # Reduce vectors
+            torch.distributed.all_reduce(
+                loss_budget_sum, op=torch.distributed.ReduceOp.SUM
+            )
+            torch.distributed.all_reduce(
+                gate_prob_sum, op=torch.distributed.ReduceOp.SUM
+            )
+
+        if n > 0:
+            for k in acc:
+                acc[k] /= n
+        loss_budget_mean = (loss_budget_sum / max(1, n)).detach().tolist()
+        gate_prob_mean = (gate_prob_sum / max(1, n)).detach().tolist()
+
+        engine.train()
+        return acc, loss_budget_mean, gate_prob_mean
+
+    # ---------------- loop ---------------- #
+
     pbar = tqdm(total=total_steps, disable=not (tqdm and is_rank0()), unit="step")
     step = 0
-    best_val_total = float("inf")
+    best = float("inf")
     best_step: Optional[int] = None
 
     for epoch in range(num_train_epochs):
@@ -452,67 +862,88 @@ def train(
             dl.sampler.set_epoch(epoch)
         for batch in dl:
             step += 1
-            loss, depth_losses, valid_tok = batch_loss(batch)
-            engine.backward(loss)
+
+            total_loss, stats = step_once(batch)
+            engine.backward(total_loss)
             engine.step()
 
             if is_rank0() and step % logging_steps == 0:
-                msg = (
+                log.info(
                     f"step {step}/{total_steps}  "
-                    + " ".join(
-                        [f"depth{i}:{l.item():.3f}" for i, l in enumerate(depth_losses)]
-                    )
-                    + f"  tot:{loss.item():.3f}  "
-                    + f"lr:{engine.get_lr()[0]:.2e}"
+                    f"gate:{stats['gate_loss']:.4f}  hardCE:{stats['hard_ce']:.4f}  "
+                    f"ent:{stats['entropy_pen']:.4f}  spread:{stats['loss_spread']:.3f}  "
+                    f"oracle:{stats['oracle_agreement']:.3f}"
                 )
-                get_logger().info(msg)
-
                 if wandb and wandb.run:
-                    log_dict = {
+                    wb = {
                         "step": step,
-                        "train/total": loss.item(),
-                        "lr": engine.get_lr()[0],
+                        "gate/train_gate_loss": float(stats["gate_loss"].item()),
+                        "gate/train_hard_ce": float(stats["hard_ce"].item()),
+                        "gate/train_entropy_pen": float(stats["entropy_pen"].item()),
+                        "gate/train_exp_loss": float(stats["exp_loss"].item()),
+                        "gate/train_oracle_agreement": float(
+                            stats["oracle_agreement"].item()
+                        ),
+                        "gate/train_loss_spread": float(stats["loss_spread"].item()),
+                        "gate/train_avg_ce": float(stats["avg_ans_ce"].item()),
                     }
-                    for i, (l, v) in enumerate(zip(depth_losses, valid_tok)):
-                        log_dict[f"loss/depth_{i}"] = l.item()
-                        log_dict[f"valid_tok/depth_{i}"] = int(v)
-                        log_dict[f"weight/depth_{i}"] = float(weights[i].item())
-                    wandb.log(log_dict)
+                    lpb = stats["loss_per_budget_mean"].detach().cpu().tolist()
+                    gp = stats["gate_probs_mean"].detach().cpu().tolist()
+                    for i, v in enumerate(lpb):
+                        wb[f"gate/train_loss_budget_{BUDGETS[i]}"] = float(v)
+                    for i, v in enumerate(gp):
+                        wb[f"gate/train_gprob_{BUDGETS[i]}"] = float(v)
+                    wandb.log(wb)
 
-            # periodic save — DeepSpeed shards only (fast, no huge all‑gather)
+            # save
             if step % save_steps == 0 or step >= total_steps:
-                ckpt_dir = Path(output_dir) / f"ckpt-{step}"
+                ckpt_dir = out_dir / f"ckpt-{step}"
                 if is_rank0():
-                    get_logger().info(f"Saved → {ckpt_dir}")
+                    log.info(f"Saved → {ckpt_dir}")
                 engine.save_checkpoint(str(ckpt_dir))
-                if torch.distributed.is_initialized():
-                    torch.distributed.barrier()
+                if is_rank0():
+                    gate_path = out_dir / f"gating_head_{step}.pt"
+                    torch.save(
+                        {
+                            "state_dict": engine.module.gate.state_dict(),
+                            "budgets": BUDGETS,
+                            "anchor": gate_anchor,
+                        },
+                        gate_path,
+                    )
+                    log.info(f"Wrote {gate_path}")
 
-            # periodic validation (lightweight)
+            # eval
             if val_dl and (step % eval_steps == 0 or step >= total_steps):
                 out = evaluate(val_dl)
                 if out is not None and is_rank0():
-                    val_total, val_d_losses, val_tok = out
-                    get_logger().info(
-                        "VAL  "
-                        + " ".join(
-                            [f"depth{i}:{v:.3f}" for i, v in enumerate(val_d_losses)]
-                        )
-                        + f"  tot:{val_total:.3f}"
+                    metrics, lpb_mean, gp_mean = out
+                    log.info(
+                        f"VAL gate:{metrics['gate_loss']:.4f} hardCE:{metrics['hard_ce']:.4f} "
+                        f"ent:{metrics['entropy_pen']:.4f} spread:{metrics['loss_spread']:.3f} "
+                        f"oracle:{metrics['oracle_agreement']:.3f}"
                     )
                     if wandb and wandb.run:
-                        wb = {"step": step, "val/total": float(val_total)}
-                        for i, (l, t) in enumerate(zip(val_d_losses, val_tok)):
-                            wb[f"val/loss/depth_{i}"] = float(l)
-                            wb[f"val/valid_tok/depth_{i}"] = int(t)
+                        wb = {
+                            "step": step,
+                            "gate/val_gate_loss": metrics["gate_loss"],
+                            "gate/val_hard_ce": metrics["hard_ce"],
+                            "gate/val_entropy_pen": metrics["entropy_pen"],
+                            "gate/val_exp_loss": metrics["exp_loss"],
+                            "gate/val_oracle_agreement": metrics["oracle_agreement"],
+                            "gate/val_loss_spread": metrics["loss_spread"],
+                            "gate/val_avg_ce": metrics["avg_ans_ce"],
+                        }
+                        for i, v in enumerate(lpb_mean):
+                            wb[f"gate/val_loss_budget_{BUDGETS[i]}"] = float(v)
+                        for i, v in enumerate(gp_mean):
+                            wb[f"gate/val_gprob_{BUDGETS[i]}"] = float(v)
                         wandb.log(wb)
 
-                    if val_total < best_val_total:
-                        best_val_total = float(val_total)
+                    if metrics["gate_loss"] < best:
+                        best = metrics["gate_loss"]
                         best_step = step
-                        get_logger().info(
-                            f"New BEST at step {step} (val_total={val_total:.4f})"
-                        )
+                        log.info(f"New BEST at step {step}: gate_loss={best:.4f}")
 
             if pbar:
                 pbar.update(1)
@@ -523,23 +954,28 @@ def train(
         wandb.finish()
 
     if is_rank0():
-        get_logger().info("Training completed.")
-        # Best symlink pointing to DS checkpoint (parent folder)
+        # Final light save
+        gate_path = out_dir / "gating_head_final.pt"
+        torch.save(
+            {
+                "state_dict": engine.module.gate.state_dict(),
+                "budgets": BUDGETS,
+                "anchor": gate_anchor,
+            },
+            gate_path,
+        )
+        log.info(f"Wrote {gate_path}")
+
         if best_step is not None:
             try:
-                best_ckpt = (Path(output_dir) / f"ckpt-{best_step}").resolve()
-                link_ckpt = Path(output_dir) / "best"
+                best_ckpt = (out_dir / f"ckpt-{best_step}").resolve()
+                link_ckpt = out_dir / "best"
                 if link_ckpt.exists() or link_ckpt.is_symlink():
                     link_ckpt.unlink()
                 link_ckpt.symlink_to(best_ckpt)
-                get_logger().info(f"Created symlink: {link_ckpt} → {best_ckpt}")
+                log.info(f"Created symlink: {link_ckpt} → {best_ckpt}")
             except Exception as e:
-                get_logger().warning(f"Failed to create best symlink: {e}")
-
-    # cleanup patched config
-    ds_cfg_patched = deepspeed_config + ".patched"
-    if is_rank0() and os.path.exists(ds_cfg_patched):
-        os.remove(ds_cfg_patched)
+                log.warning(f"Failed to create best symlink: {e}")
 
 
 if __name__ == "__main__":

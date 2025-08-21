@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "matryoshka-reasoning"
+version = "0.1.0"
+description = "Matryoshka Reasoning: adaptive depth CoT training & inference with DeepSpeed + HF Transformers."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Jun Kim" }]
+dependencies = [
+  "transformers>=4.40.0",
+  "tqdm>=4.66.0",
+  "fire>=0.5.0",
+  "jsonlines>=4.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/junkim100/Matryoshka-Reasoning"
+Repository = "https://github.com/junkim100/Matryoshka-Reasoning"
+Issues = "https://github.com/junkim100/Matryoshka-Reasoning/issues"
+
+[project.optional-dependencies]
+train = [
+  "deepspeed>=0.13.0",
+  "datasets>=2.19.0",
+  "wandb>=0.16.0",
+]
+data = [
+  "datasets>=2.19.0",
+  "jsonlines>=4.0.0",
+]
+
+[tool.setuptools]
+# This says: treat the folder "src/" as the import root.
+package-dir = {"" = "src"}
+# Install a *module* (single .py) that lives under src/
+py-modules = ["matryoshka_infer"]

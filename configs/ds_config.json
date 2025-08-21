@@ -1,7 +1,7 @@
 {
-    "train_batch_size": 256,
-    "train_micro_batch_size_per_gpu": 1,
-    "gradient_accumulation_steps": 32,
+    "train_batch_size": 2048,
+    "train_micro_batch_size_per_gpu": 32,
+    "gradient_accumulation_steps": 8,
 
     "fp16": {
       "enabled": false,
@@ -47,6 +47,15 @@
       "stage3_prefetch_bucket_size": 5e8
     },
 
+    "activation_checkpointing": {
+      "partition_activations": true,
+      "cpu_checkpointing": true,
+      "contiguous_memory_optimization": false,
+      "number_checkpoints": null,
+      "synchronize_checkpoint_boundary": false,
+      "profile": false
+    },
+
     "gradient_clipping": 1.0,
     "wall_clock_breakdown": false
-  }
+}

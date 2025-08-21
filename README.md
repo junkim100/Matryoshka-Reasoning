@@ -147,20 +147,62 @@ python scripts/convert_ds_to_hf.py \
 ```
 Matryoshka-Reasoning/
 ├── src/
-│   ├── train.py           # Trainer that can save HF checkpoints during run (slower)
-│   └── train_ds_only.py   # Trainer that saves DS shards only (recommended; faster saves)
+│   ├── train.py              # DeepSpeed trainer with learned gating head
+│   └── matryoshka_infer.py   # Unified inference engine with adaptive depth selection
 ├── scripts/
-│   ├── run.sh             # Example launcher
-│   └── convert_ds_to_hf.py# Offline DS→HF converter (adds <think>/</think>, resizes embeddings)
+│   ├── run.sh                # Example training launcher
+│   ├── convert_ds_to_hf.py   # DS→HF converter (adds <think>/</think>, resizes embeddings)
+│   ├── chat_cli.py           # Interactive chat interface with reasoning visualization
+│   └── evaluate.py           # YAML-configurable evaluation framework
+├── eval/
+│   ├── config.py             # YAML task configuration loader
+│   ├── metrics.py            # Math-aware evaluation metrics
+│   └── runner.py             # Per-depth evaluation runner
 ├── configs/
-│   └── ds_config.json     # Sample ZeRO-3 config
+│   └── ds_config.json        # Sample ZeRO-3 config
 ├── data/
-│   ├── download_dataset.py
-│   └── *.jsonl
+│   ├── download_dataset.py   # Multi-dataset builder with chat template support
+│   └── *.jsonl              # Training data files
 ├── environment.yml
+├── pyproject.toml
 ├── README.md
 └── LICENSE
 ```
+
+---
+
+## Inference & Evaluation
+
+### Interactive Chat
+
+```bash
+python scripts/chat_cli.py \
+  --model output/exp1/ckpt-100-hf \
+  --budgets "0,64,160,384,-1" \
+  --device cuda:0
+```
+
+Features:
+- **Adaptive depth selection** via learned gating head
+- **Reasoning visualization** with token counts and timing
+- **Budget control** for different reasoning depths
+- **Natural vs forced closure detection**
+
+### Evaluation Framework
+
+```bash
+# Example evaluation (config files need to be created)
+python scripts/evaluate.py \
+  --config configs/your_task.yaml \
+  --model output/exp1/ckpt-100-hf \
+  --output results/your_task.json
+```
+
+Features:
+- **YAML-configurable tasks** with EleutherAI-like schema
+- **Per-depth evaluation** with automatic depth selection
+- **Math-aware metrics** with `\boxed{}` extraction and numerical equivalence
+- **Token usage statistics** for reasoning vs answer generation
 
 ---
 

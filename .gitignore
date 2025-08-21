@@ -144,6 +144,9 @@ output/
 # Weights & Biases
 wandb/
 
+# Results
+results/
+
 # Model checkpoints and cache
 *.bin
 *.safetensors
